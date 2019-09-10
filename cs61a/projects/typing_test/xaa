@@ -1,0 +1,4 @@
+
+python3 ok -q 01
+exit()
+cd ~/Desktop/cs61a/projects/typing_test

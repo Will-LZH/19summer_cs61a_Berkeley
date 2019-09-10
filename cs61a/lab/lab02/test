@@ -1,0 +1,9 @@
+def even(f):
+     def odd(x):
+         if x < 0:
+             return f(-x)
+         return f(x)
+     return odd
+steven = lambda x: x
+stewart = even(steven)
+print(stewart(61))

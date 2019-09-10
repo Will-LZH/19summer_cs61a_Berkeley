@@ -1,0 +1,694 @@
+var  /* NOTE: (1) These are PREFIXES, so e.g. 3.1 will match 3.11,
+	and   (2) These versions must be TESTED for compatibility to make sure Python can run! Don't just randomly mix and match them! */
+	DEFAULT_GIT_FOR_WINDOWS_VERSION_PREFIX = "2.21.0",
+	DEFAULT_PYTHON_VERSION_PREFIX          = "3.7.2-1",
+	KNOWN_FILE_SHA256_HASHES = {
+		"i686": /* 32-bit */ {
+			"python-3.7.2-1-i686.pkg.tar.xz": "e14ae50d791ffd7232fc9e2688052515f7812ec098b5442fbb53cd03d0b15dc4"
+		},
+		"x86_64": /* 64-bit */ {
+			"python-3.7.2-1-x86_64.pkg.tar.xz": "b14ca1bb5beeff82f0643d01ff75b797e75b9f49c06001e76a67fce19a8b7858"
+		}
+	}
+	DOWNLOAD_SPEED_TEST_FILE               = "http://repo.msys2.org/msys/x86_64/glib2-devel-2.54.3-1-x86_64.pkg.tar.xz" /* just a small sample file to do a rough speed test */;
+
+// For command-line usage instructions, see main().
+
+var FSO = WScript.CreateObject('Scripting.FileSystemObject');
+var WshShell = WScript.CreateObject('WScript.Shell');
+var ShellApp = WScript.CreateObject('Shell.Application');
+var WshProcEnv = WshShell.Environment('Process');
+var CTL_E_FILEALREADYEXISTS = 0x800A003A, COR_E_ENDOFSTREAM = 0x800A003E, STIERR_OBJECTNOTFOUND = 0x80070002;
+var PACKAGE_NAME_PATTERN = /^(.*)-([^\-]+-[^\-]+)(?:-(?:x(?:86_)?64|i[3-6]86))\.pkg(?:\.\w+)*/;
+
+function to_hex_string(number) {
+	if (number < 0) {
+		number = 0xFFFFFFFF + number + 1;
+	}
+	return number.toString(16).toUpperCase();
+}
+
+function error_code_to_string(number) {
+	return Math.abs(number) > (1 << 16) ? "0x" + to_hex_string(number) : number;
+}
+
+function duration_to_human(seconds) {
+	var result;
+	if (seconds >= 60) {
+		var s = (seconds / 60).toFixed(seconds < 2 * 60 ? 1 : 0);
+		result = s + " " + (seconds.toFixed(0) == "1" ? "minute" : "minutes");
+	} else {
+		var s = seconds.toFixed(0);
+		result = s + " " + (seconds.toFixed(0) == "1" ? "second" : "seconds");
+	}
+	return result;
+}
+
+function get_processor_architecture() {
+	return WshProcEnv('PROCESSOR_ARCHITECTURE').toUpperCase() === 'AMD64'.toUpperCase() || WshProcEnv('PROCESSOR_ARCHITEW6432').toUpperCase() === 'AMD64'.toUpperCase() ? 64 : 32;
+}
+
+function create_command_line(argv, for_cmd) /* Note: Does NOT handle backslashes before double-quotes correctly! */ {
+	var quoted_args = [];
+	var re1 = /(\")/g;
+	var re2 = /[\"\^\(\)%!\t ]/g;
+	for (var i = 0; i !== argv.length; ++i) {
+		var arg = argv[i];
+		if (arg !== null) {
+			var quoted_arg = arg.replace(re1, for_cmd ? "^$1" : "\\$1");
+			if (arg != arg.replace(re2, "\"\1\"")) {
+				quoted_arg = "\"" + quoted_arg + "\"";
+			}
+			quoted_args.push(quoted_arg);
+		}
+	}
+	return quoted_args.join(" ");
+}
+
+function run(cmd, stdout_sink, stderr_sink) {
+	var result = null;
+	var process = WshShell.Exec(cmd);
+	if (process !== null) {
+		try {
+			process.StdIn.Close();
+			var streams = [{input: process.StdOut, output: WScript.StdOut}, {input: process.StdErr, output: WScript.StdErr}];
+			var stdout = process.StdOut.ReadAll();
+			stdout_sink ? stdout_sink(stdout) : WScript.StdOut.Write(stdout);
+			var stderr = process.StdErr.ReadAll();
+			stderr_sink ? stderr_sink(stderr) : WScript.StdErr.Write(stderr);
+			while (!process.Status) {
+				process.StdOut.ReadLine();
+				process.StdErr.ReadLine();
+			}
+		} finally {
+			process.Terminate();
+		}
+		result = process.ExitCode;
+	} else {
+		result = -1;
+	}
+	return result;
+}
+
+function GetWindowsFolder() {
+	return FSO.GetSpecialFolder(0);
+}
+
+function GetSystemFolder() {
+	return FSO.GetSpecialFolder(1);
+}
+
+function GetTempFolder() {
+	return FSO.GetSpecialFolder(2);
+}
+
+function try_compute_file_digest_base64(filepath, digest) /* returns error code on error, or hash as base64 string otherwise */ {
+	if (!digest) { throw new Error("invalid digest algorithm: " + digest); }
+	var lines = [];
+	var result = run(create_command_line([FSO.BuildPath(GetSystemFolder(), 'certutil.exe'), '-hashfile', filepath, digest]), function (text) { lines.push(text); });
+	lines = lines.join("\n").replace(/\r/g, "").split("\n");
+	return result === 0 ? lines[1].replace(/[ \t\.-]/g, "") : result;
+}
+
+function check_file_digest(filepath, expected_sha256, key /* optional */) /* returns > 0 if correct, 0 if hash was computed but correct hash is unknown, < 0 if failed, null/undefined if unable to compute hash */ {
+	var result = null;
+	if (expected_sha256) {
+		try {
+			var hash = try_compute_file_digest_base64(filepath, 'SHA256');
+			if (typeof hash === 'string') {
+				var effective_key = key;
+				if (!(effective_key && effective_key in expected_sha256)) {
+					var pseudo_key = FSO.GetFileName(filepath);
+					if (pseudo_key in expected_sha256) {
+						effective_key = pseudo_key;
+					}
+				}
+				var expected = effective_key && effective_key in expected_sha256 ? expected_sha256[effective_key] : null;
+				var expected_array = expected ? expected instanceof Array ? expected : [expected] : null;
+				result = 0;
+				if (expected_array !== null) {
+					for (var i = 0; i < expected_array.length; ++i) {
+						if (result === 0) {
+							result = -1;
+						}
+						if (expected_array[i].toLowerCase() === hash.toLowerCase()) {
+							result = +1;
+						}
+					}
+				}
+			}
+		} catch (ex) { }
+	}
+	return result;
+}
+
+function save(data, filename) {
+	var stream = WScript.CreateObject('ADODB.Stream');
+	stream.Open();
+	try {
+		var is_text = typeof data === 'string';
+		stream.Type = is_text ? 2 /*adTypeText*/ : 1 /*adTypeBinary*/;
+		if (is_text) {
+			stream.WriteText(data);
+		} else {
+			stream.Write(data);
+		}
+		stream.Position = 0;
+		stream.SaveToFile(filename, 2 /*adSaveCreateOverWrite*/);
+	} finally {
+		stream.Close();
+	}
+}
+
+function save_text(ascii, filename, mode, newline) {
+	if (ascii instanceof Array) {
+		if (!newline) { newline = "\r\n"; }
+		ascii = ascii.join(newline) + (ascii.length > 0 ? newline : "");
+	}
+	var inffile = FSO.OpenTextFile(filename, typeof mode !== 'undefined' && mode !== null && mode ? mode : 2, true, 0);
+	try {
+		inffile.Write(ascii);
+	} finally {
+		inffile.Close();
+	}
+}
+
+function decode_url_basename(url) {
+	return decodeURIComponent(url.match(/^(?:[^?&#]+\/)?([^\/?&#]*)(?:$|[?&#])/)[1]);
+}
+
+var internet_connection_speed = null;
+function download(url, binary_flag_or_file_path, expected_content_type /* optional */, curl_path /* optional */, expected_sha256 /* optional */) {
+	if (typeof binary_flag_or_file_path !== 'boolean' && typeof binary_flag_or_file_path !== 'string') {
+		throw new Error("Expected boolean parameter for 'binary_flag_or_file_path'");
+	}
+	var result = -1, report_progress = false;
+	try {
+		var inherit_stderr_and_stdout = typeof binary_flag_or_file_path === 'string';
+		if (typeof binary_flag_or_file_path === 'string') {
+			var file_exists = FSO.FileExists(binary_flag_or_file_path);
+			var integrity_check_status = check_file_digest(binary_flag_or_file_path, expected_sha256, url);
+			if (!(integrity_check_status < 0) && file_exists) {
+				/* file already exists! */
+				result = 0;
+			} else {
+				if (file_exists) {
+					WScript.StdErr.WriteLine("existing file appears to be correct or tampered with; will retry downloading: " + binary_flag_or_file_path);
+				}
+				WScript.StdErr.Write("Downloading " + url + " to " + binary_flag_or_file_path + "...");
+				report_progress = true;
+			}
+		}
+		var system_curl_path = FSO.BuildPath(GetSystemFolder(), "curl.exe");
+		if ((!curl_path || !FSO.FileExists(curl_path)) && FSO.FileExists(system_curl_path)) {
+			curl_path = system_curl_path;
+		}
+		var powershell_path = FSO.BuildPath(FSO.BuildPath(FSO.BuildPath(GetSystemFolder(), "WindowsPowerShell"), "v1.0"), "powershell.exe");
+		var exception_thrown = null;
+		if (result === -1) {
+			try {
+				// Enable TLS 1.2 -- it isn't always enabled by default
+				var TLS_1_2 = 0x800;
+				var secure_protocols_key = "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\SecureProtocols";
+				var secure_protocols = WshShell.RegRead(secure_protocols_key);
+				if (!(secure_protocols & TLS_1_2)) {
+					WshShell.RegWrite(secure_protocols_key, secure_protocols | TLS_1_2, 'REG_DWORD');
+				}
+				var classes = ['MSXML2.ServerXMLHTTP.6.0', 'MSXML2.XMLHTTP.6.0', 'WinHttp.WinHttpRequest.5.1'];
+				var xhr = null;
+				for (var i = 0; i < classes.length; ++i) {
+					var classname = classes[i];
+					try {
+						xhr = WScript.CreateObject(classname);
+					} catch (ex) { continue; }
+					var tstart = new Date().getTime();
+					var tstart_test = new Date().getTime();
+					try {
+						xhr.onreadystatechange = function () {
+							if (xhr.readyState === 3) {
+								tstart = new Date().getTime();
+								if (report_progress) {
+									var content_length = null;
+									try {
+										content_length = xhr.getResponseHeader('Content-Length');
+									} catch (ex) { }
+									if (content_length >= (1 << 20)) {
+										if (internet_connection_speed === null) {
+											try {
+												if (DOWNLOAD_SPEED_TEST_FILE) {
+													var tstart_test = new Date().getTime();
+													var xhr_test = WScript.CreateObject(classname);
+													xhr_test.onreadystatechange = function () {
+														if (xhr_test.readyState === 3) {
+															tstart_test = new Date().getTime();
+														}
+													};
+													xhr_test.open('GET', DOWNLOAD_SPEED_TEST_FILE, false);
+													xhr_test.send();
+													internet_connection_speed = +xhr_test.getResponseHeader('Content-Length') / ((new Date().getTime() - tstart_test) / 1000);
+												}
+											} catch (ex) { }
+										}
+										var wait_time = internet_connection_speed > 0 ? content_length / internet_connection_speed : null;
+										WScript.StdErr.WriteLine();
+										WScript.StdErr.Write("Download is " + (+content_length / (1 << 20)).toFixed(2) + " MiB; please wait" + (wait_time > 1 ? " ~" + duration_to_human(wait_time) + " " + "(" + (internet_connection_speed / (1 << 20)).toFixed(2) + " MiB/s" + ")" : "") + "...");
+									}
+								}
+							}
+						};
+					} catch (ex) { /* if we can't get progress information then don't worry */ }
+					xhr.open('GET', url, false);
+					var download_succeeded = false;
+					try {
+						xhr.send();
+						download_succeeded = true;
+					} catch (ex) {
+						if (i === classes.length - 1) {
+							throw ex;
+						}
+					}
+					if (download_succeeded) {
+						if (report_progress) {
+							WScript.StdErr.Write(" finished in " + duration_to_human((new Date().getTime() - tstart) / 1000) + ".");
+						}
+						break;
+					}
+				}
+				if (xhr && xhr.status !== 200) {
+					result = null;
+					var e = new Error(xhr.status + ": " + xhr.statusText);
+					e.number = xhr.status;
+					throw e;
+				}
+				var response = (!expected_content_type || (typeof expected_content_type === 'string' ? xhr.getResponseHeader('Content-Type') === expected_content_type : xhr.getResponseHeader('Content-Type').match(expected_content_type))) ? binary_flag_or_file_path !== false ? xhr.responseBody : xhr.responseText : null;
+				if (typeof binary_flag_or_file_path === 'string' && response !== null) {
+					save(response, binary_flag_or_file_path);
+					result = 0;
+				} else {
+					result = response;
+				}
+			} catch (ex) {
+				exception_thrown = ex;
+			}
+		}
+		if (result === -1 && FSO.FileExists(powershell_path)) {
+			try {
+				var script = "& { $ErrorActionPreference = 'Stop'; $protocol = [Net.ServicePointManager]::SecurityProtocol; $protocol.value__ = $protocol.value__ -bor 0xC00; [Net.ServicePointManager]::SecurityProtocol = $protocol; $WebClient = New-Object System.Net.WebClient; $WebClient.Headers.Add('User-Agent', 'Mozilla/5.0 Safari'); If ($args[1]) { $WebClient.DownloadFile($args[0], $args[1] + '.tmp'); Move-Item -Force ($args[1] + '.tmp') $args[1]; } Else { $WebClient.DownloadString($args[0]) } }";
+				var cmdline = create_command_line([powershell_path, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script, url, typeof binary_flag_or_file_path === 'string' ? binary_flag_or_file_path : '']);
+				var lines = [];
+				result = run(cmdline, typeof binary_flag_or_file_path === 'string' ? null : function (line) { lines.push(line); });
+				if (result === 0) {
+					result = lines.join("\r\n") /* should be only 1 line anyway */;
+				}
+			} catch (ex) {
+				if (exception_thrown === null) { exception_thrown = ex; }
+			}
+		}
+		if (result === -1 && FSO.FileExists(curl_path)) {
+			try {
+				var cmdline = create_command_line([curl_path, inherit_stderr_and_stdout ? null : "-s", "-L", "-J", "-o", typeof binary_flag_or_file_path === 'string' ? binary_flag_or_file_path + ".tmp" : "-", url]);
+				var lines = [];
+				var temp_result = run(cmdline, typeof binary_flag_or_file_path === 'string' ? null : function (line) { lines.push(line); });
+				if (temp_result !== 0) {
+					throw new Error("code " + error_code_to_string(temp_result) + " from command: " + cmdline);
+				}
+				if (typeof binary_flag_or_file_path === 'string') {
+					if (FSO.FileExists(binary_flag_or_file_path)) {
+						FSO.DeleteFile(binary_flag_or_file_path, true);
+					}
+					FSO.MoveFile(binary_flag_or_file_path + ".tmp", binary_flag_or_file_path);
+				}
+				result = temp_result;
+				if (result === 0) {
+					result = lines.join("\r\n") /* should be only 1 line anyway */;
+				}
+			} catch (ex) { if (exception_thrown === null) { exception_thrown = ex; } }
+		}
+		if (result === -1) {
+			var local_file = FSO.BuildPath(FSO.GetParentFolderName(WScript.ScriptFullName), decode_url_basename(url));
+			throw new Error([
+				"Error " + (exception_thrown ? error_code_to_string(exception_thrown.number) + " " : "") + "downloading: " + url,
+				"Please re-run this script after manually downloading the file to: " + local_file + "."
+			].join("\r\n"));
+		}
+		if (typeof result === 'number' && result !== 0 && exception_thrown) {
+			throw exception_thrown;
+		}
+		if (check_file_digest(binary_flag_or_file_path, expected_sha256) < 0) {
+			throw new Error("File integrity verification failed: " + binary_flag_or_file_path + "; expected SHA-256 hash: " + (expected_sha256 ? expected_sha256[FSO.GetFileName(binary_flag_or_file_path)] : null));
+		}
+	} finally {
+		if (report_progress) {
+			WScript.StdErr.WriteLine();
+		}
+	}
+	return result;
+}
+
+function CreateFolderAndAncestorsIfNotExist(folder_path) {
+	var parents = [];
+	for (;;) {
+		if (FSO.FolderExists(folder_path)) { break; }
+		parents.push(folder_path);
+		var parent = FSO.GetParentFolderName(folder_path);
+		if (!parent || parent === folder_path) { break; }
+		folder_path = parent;
+	}
+	while (parents.length > 0) {
+		try {
+			FSO.CreateFolder(parents.pop());
+		} catch (ex) {
+			if (!(ex.number ^ CTL_E_FILEALREADYEXISTS)) /* a race condition could cause someone else to create the folder, but that's fine */ {
+				break;
+			}
+			throw ex;
+		}
+	}
+}
+
+function msys2_install_package(msys2_dir, mingw_dir, url, expected_sha256, delete_downloads_before_exit) {
+	var status = -1;
+	if (url) {
+		var newline = '\n';
+		var package_name = decode_url_basename(url);
+		var pacman_pkg_cache_folder = FSO.BuildPath(FSO.BuildPath(FSO.BuildPath(FSO.BuildPath(msys2_dir, "var"), "cache"), "pacman"), "pkg");
+		CreateFolderAndAncestorsIfNotExist(pacman_pkg_cache_folder);
+		var pacman_log_folder = FSO.BuildPath(FSO.BuildPath(msys2_dir, "var"), "log");
+		CreateFolderAndAncestorsIfNotExist(pacman_log_folder);
+		var pacman_package_folder_name = package_name.replace(PACKAGE_NAME_PATTERN, "$1-$2");
+		var pacman_local_folder = FSO.BuildPath(FSO.BuildPath(FSO.BuildPath(FSO.BuildPath(FSO.BuildPath(msys2_dir, "var"), "lib"), "pacman"), "local"), pacman_package_folder_name);
+		CreateFolderAndAncestorsIfNotExist(pacman_local_folder);
+		var tempfilepath = FSO.BuildPath(pacman_pkg_cache_folder, package_name);
+		var local_file = FSO.BuildPath(FSO.GetParentFolderName(WScript.ScriptFullName), package_name);
+		if (FSO.FileExists(local_file)) {
+			WScript.StdErr.WriteLine("Using already downloaded file: " + local_file);
+			tempfilepath = local_file;
+		}
+		try {
+			download(url, tempfilepath, "application/octet-stream", mingw_dir ? FSO.BuildPath(FSO.BuildPath(mingw_dir, "bin"), "curl.exe") : null, expected_sha256);
+			WScript.StdErr.WriteLine("Extracting " + tempfilepath + " to " + msys2_dir + "...");
+			var lines = [];
+			status = run(create_command_line([FSO.BuildPath(FSO.BuildPath(FSO.BuildPath(msys2_dir, "usr"), "bin"), "tar.exe"), "-C", win32path_to_msys2_path(msys2_dir), "-x", "-f", win32path_to_msys2_path(tempfilepath), "-v", "--exclude=.INSTALL", "--exclude=.PKGINFO", "--exclude=.BUILDINFO"]), function (text) {
+				lines.push(text);
+			});
+			if (status !== 0) { WScript.StdErr.WriteLine(); throw new Error("Error " + status + " when installing: " + url); }
+			save_text([
+				[
+					"[" + (function (date) { var re = /\d\d$/; return [date.getYear(), "-", ("0" + date.getMonth()).match(re)[0], "-", ("0" + date.getDay()).match(re)[0], " ", ("0" + date.getHours()).match(re)[0], ":", ("0" + date.getMinutes()).match(re)[0]].join(""); })(new Date()) + "]",
+					"[" + WScript.ScriptName + "]",
+					"installed",
+					package_name.replace(PACKAGE_NAME_PATTERN, "$1 ($2)")
+				].join(" ")
+			], FSO.BuildPath(pacman_log_folder, "pacman.log"), 8, newline);
+			var mtree = FSO.BuildPath(msys2_dir, ".MTREE");
+			if (FSO.FileExists(mtree)) {
+				var target = FSO.BuildPath(pacman_local_folder, "mtree");
+				if (FSO.FileExists(target)) {
+					FSO.DeleteFile(target);
+				}
+				FSO.MoveFile(mtree, target);
+			}
+			save_text([
+				"%FILES%",
+				lines.join(newline).replace(/^.MTREE\r?\n/m, ""),
+				"var/lib/",
+				"var/lib/pacman/",
+				"var/lib/pacman/local/",
+				"var/lib/pacman/local/" + pacman_package_folder_name + "/",
+				"var/lib/pacman/local/" + pacman_package_folder_name + "/" + "files",
+				"var/lib/pacman/local/" + pacman_package_folder_name + "/" + "mtree"
+			], FSO.BuildPath(pacman_local_folder, "files"), null, newline);
+		} finally {
+			if (tempfilepath !== local_file && FSO.FileExists(tempfilepath)) {
+				try {
+					if (delete_downloads_before_exit !== false) { FSO.DeleteFile(tempfilepath); }
+				} catch (ex) { /* ignore errors deleting temporary files... */ }
+			}
+		}
+	}
+	return status;
+}
+
+function win32path_to_msys2_path(path) {
+	return path.replace(/^([A-Z]):[\\/]/, function (m) { return "/" + m.substring(0, 1).toLowerCase() + m.substring(2); }).replace(/\\/g, "/");
+}
+
+function main(argv) /* Usage: Pass the desire Python version as the first argument (e.g. "3.6") */ {
+	var has_integrity = false, has_high_integrity = false;
+	try {
+		run(create_command_line([FSO.BuildPath(GetSystemFolder(), 'whoami.exe'), '/groups']), function (text) {
+			var lines = text.match(/[^\r\n]+/g);
+			for (var i = 0; i < lines.length; ++i) {
+				var line = lines[i];
+				if (line.indexOf('Mandatory Label\\') === 0) { has_integrity = true; }
+				if (line.match(/^Mandatory Label\\High Mandatory Level +Label +S-1-16-12288 +/)) { has_high_integrity = true; }
+			}
+		});
+	} catch (ex) {
+		if (ex.number ^ STIERR_OBJECTNOTFOUND) {
+			throw ex;
+		}
+		/* File not found -- couldn't find whoami for some reason; just ignore */
+	}
+	var python_version_requested = argv.length > 0 ? argv[0] : null;
+	var add_to_path_requested = argv.length > 1 ? argv[1].toLowerCase() === "true".toLowerCase() || argv[1].toLowerCase() === "1".toLowerCase() : null;
+	var delete_downloads_before_exit = false;
+	var cscript = "cscript";
+	if (!python_version_requested) {
+		python_version_requested = DEFAULT_PYTHON_VERSION_PREFIX;
+	}
+	var relaunch = has_integrity && !has_high_integrity;
+	try {
+		WScript.StdErr.WriteLine("Preparing to install Python" + (python_version_requested ? " " + python_version_requested : "") + "...");
+	} catch (ex) {
+		if (FSO.GetBaseName(FSO.GetFileName(WScript.FullName)).toLowerCase() === cscript.toLowerCase()) {
+			throw ex;
+		}
+		relaunch = true;
+	}
+	if (relaunch) {
+		return ShellApp.ShellExecute(FSO.BuildPath(WScript.Path, cscript + ".exe"), create_command_line((WScript.Interactive ? [] : ["//B"]).concat(["//Nologo", WScript.ScriptFullName]).concat(argv)), "", "runas", 1);
+	}
+	var ctrl_c_pressed = false;
+	try {
+		if (has_integrity && !has_high_integrity) {
+			throw new Error("Please run this program with administrator privileges.\r\nYou can do this by launching it from a Command Prompt window that you \"Run as Administrator\".");
+		}
+		var arch = get_processor_architecture();
+		var msysarch = arch === 64 ? "x86_64" : "i686";
+		var repodir = "http://repo.msys2.org/msys/" + msysarch + "/";
+		var
+			python_url = null;
+		WScript.StdErr.Write("Searching " + repodir + " for Python" + (python_version_requested ? " " + python_version_requested : "") + "...");
+		try {
+			var page = download(repodir, false, /^text\/html(?:$|;)/);
+			var potential_urls = [];
+			for (var regex = /<a href="([^\"]+)">/g, match; (match = regex.exec(page)) !== null; ) /* we have to use regex since there's no usable HTML parser */ {
+				potential_urls.push(match[1]) /* TODO: decode HTML */;
+			}
+			for (var i = 0; i < potential_urls.length; ++i) {
+				var url = repodir + potential_urls[i];
+				var name = decode_url_basename(url);
+				if (!name.match(/\.sig$/i)) {
+					if (name.match(/^python-\d/) && name.indexOf("python-" + (python_version_requested || "")) === 0) {
+						python_url = url;
+					}
+				}
+			}
+			if (!python_url) {
+				throw new Error("Could not find a matching version for Python" + (python_version_requested ? " " + python_version_requested : "") + "!");
+			}
+			WScript.StdErr.Write(" " + python_url);
+		} finally {
+			WScript.StdErr.WriteLine();
+		}
+		// To extract ZIP file:  var folder = ShellApp.NameSpace(target_directory); folder.CopyHere(zip_file_path);
+		var msys2_dir_key = "HKEY_LOCAL_MACHINE\\SOFTWARE\\GitForWindows\\InstallPath";
+		var msys2_dir = null, msys2_found_url = null;
+		try {
+			msys2_dir = WshShell.RegRead(msys2_dir_key);
+		} catch (ex) { /* key might not exist */ }
+		if (!msys2_dir) {
+			WScript.StdErr.Write("Searching for latest version of Git-for-Windows to install Python into...");
+			try {
+				var msys2_version_url = "https://api.github.com/repos/git-for-windows/git/releases";
+				var json = download(msys2_version_url, false, /^application\/json(?:$|;)/);
+				var potential_urls = [];
+				for (var regex = /"browser_download_url"\s*:\s*"((?:[^\\\"]+|\\.)*)"/g, match; (match = regex.exec(json)) !== null; ) /* we have to use regex since there's no JSON implementation here */ {
+					var url = match[1].replace(/\\./, function (m) { return m.substring(1); });
+					var name_match = url.match(/^[^?&]*\/([^\/?=]*\.exe)(?:$|\?)/i);
+					if (name_match) {
+						potential_urls.push(url);
+						var name = name_match ? name_match[1] : null;
+						if (name && name.toLowerCase().indexOf("git-" + (DEFAULT_GIT_FOR_WINDOWS_VERSION_PREFIX ? DEFAULT_GIT_FOR_WINDOWS_VERSION_PREFIX.toLowerCase() : "")) === 0 && (name.indexOf(arch + "-bit") >= 0 || name.indexOf(arch + " bit") >= 0) && !name.match("[\\.\\-]rc\\d+\\.")) {
+							msys2_found_url = url;
+							msys2_found_name = name;
+							break;  // we want the first match here, not the last one
+						}
+					}
+				}
+				if (!msys2_found_url) {
+					throw new Error("Could not find detect the latest version of Git-for-Windows!" + "\r\n" + "Please check: " + msys2_version_url + "\r\n" + "Candidate URLs:" + "\r\n" + potential_urls.join("\r\n"));
+				}
+				WScript.StdErr.Write(" " + msys2_found_url);
+			} finally {
+				WScript.StdErr.WriteLine();
+			}
+		}
+		var asterisks = "************************************************************************";
+		var confirm_installation = (function (confirmed) {
+			return function () {
+				if (!confirmed) {
+					if (WScript.Interactive) {
+						WScript.StdErr.WriteLine(asterisks);
+						if (add_to_path_requested) {
+							WScript.StdErr.WriteLine("NOTE: Python and Git-Bash commands will visible to ALL programs.");
+							WScript.StdErr.WriteLine("The commands might end up overriding those built into Windows.");
+						} else {
+							WScript.StdErr.WriteLine("NOTE: Python will be ONLY available from within Git-Bash.");
+							WScript.StdErr.WriteLine("It will NOT be visible from Explorer, the Command Prompt, or elsewhere.");
+						}
+						WScript.StdErr.WriteLine(asterisks);
+						WScript.StdErr.Write    ("Press ENTER to begin installing, or Ctrl+C to cancel...");
+						try {
+							WScript.StdIn.ReadLine();
+						} catch (ex) {
+							if (!(ex.number ^ COR_E_ENDOFSTREAM)) {
+								ctrl_c_pressed = true;
+								return false;
+							}
+							throw ex;
+						}
+					}
+					confirmed = true;
+				}
+			};
+		})(false);
+		var uninstall_git_for_windows = 'uninstall-git-for-windows';
+		if (!msys2_dir) {
+			if (confirm_installation() === false) { return -1; }
+			var tempfilepath = FSO.BuildPath(GetTempFolder(), msys2_found_name);
+			var tempinfpath = tempfilepath + ".inf";
+			var local_file = FSO.BuildPath(FSO.GetParentFolderName(WScript.ScriptFullName), msys2_found_name);
+			if (FSO.FileExists(local_file)) {
+				WScript.StdErr.WriteLine("Using already downloaded file: " + local_file);
+				tempfilepath = local_file;
+			}
+			try {
+				download(msys2_found_url, tempfilepath, "application/octet-stream");
+				try {
+					WScript.StdErr.WriteLine("Installing Git-for-Windows...");
+					save_text([
+						'[Setup]',
+						'Group=Git',
+						'NoIcons=0',
+						'EditorOption=Nano',
+						'PathOption=' + (add_to_path_requested ? 'CmdTools' : 'BashOnly'),
+						'SSHOption=OpenSSH',
+						'CURLOption=WinSSL',
+						'CRLFOption=CRLFAlways',
+						'BashTerminalOption=MinTTY',
+						'PerformanceTweaksFSCache=Enabled',
+						'UseCredentialManager=Enabled',
+						'EnableSymlinks=Enabled'
+					], tempinfpath);
+					var status = WshShell.Run(create_command_line([tempfilepath, "/Silent", "/NoRestart", "/SP-", "/CloseApplications", "/RestartApplications", "/Components=icons,icons\\desktop,ext,ext\\shellhere", "/LoadINF=" + tempinfpath]), 10, true);
+					if (status !== 0) { WScript.Echo("Error " + status + " when installing: " + msys2_found_url); return status; }
+					msys2_dir = WshShell.RegRead(msys2_dir_key);
+					var newline = '\n';
+					save_text([
+						'ClicksPlaceCursor=yes',
+						'Columns=140',
+						'Rows=40',
+						'ScrollbackLines=1000000',
+						'PgUpDnScroll=yes',
+						'CtrlShiftShortcuts=yes',
+						'ClipShortcuts=no'
+					], FSO.BuildPath(FSO.BuildPath(msys2_dir, "etc"), "minttyrc"), null, newline);
+					save_text([
+						"",
+						"set nowrap  # Don’t hard-wrap text at all.",
+						"set nonewlines  # Don’t automatically add a newline to the ends of files.",
+						"set noconvert  # Don’t convert files from DOS/Mac format.",
+						"set constantshow  # Constantly display the cursor position in the status bar. (The old form of this option, ’set const’, is deprecated.)",
+						"#set mouse  # Enable mouse support, if available for your system. When enabled, mouse clicks can be used to place the cursor, set the mark (with a double click), and execute shortcuts. The mouse will work in the X Window System, and on the console when gpm is running.",
+						"set smooth  # Use smooth scrolling by default.",
+						"set smarthome  # Make the Home key smarter. When Home is pressed anywhere but at the very beginning of non-whitespace characters on a line, the cursor will jump to that beginning (either forwards or backwards). If the cursor is already at that position, it will jump to the true beginning of the line."
+					], FSO.BuildPath(FSO.BuildPath(msys2_dir, "etc"), "nanorc"), 8, newline);
+					save_text([
+						'',
+						'"\\e[A": history-search-backward',
+						'"\\e[B": history-search-forward',
+						'set bell-style none' /* default is 'visible', which causes a scrolling bug */
+					], FSO.BuildPath(FSO.BuildPath(msys2_dir, "etc"), "inputrc"), 8, newline);
+					save_text([
+						'unset GIT_EXEC_PATH GIT_TEMPLATE_DIR GITPERLLIB',
+						'uninstall-python() { if (unset GREP_OPTIONS && { ps -a | 1>&2 grep /usr/bin/python; }); then return 1; fi && echo "Uninstalling Python..." 1>&2 && (set -e -u +o pipefail && unset GREP_OPTIONS && cd / && { tac /var/lib/pacman/local/python-*/files | grep -v \"^\\(usr/share/licenses/\\|usr/share/\\|usr/lib/\\|usr/bin/\\|usr/\\)$\" | xargs -r -- rm -f -d --; }); }',
+						uninstall_git_for_windows + '() { uninstall-python && echo "Uninstalling Git-for-Windows..." 1>&2 && { (set -euo pipefail && cd / && rm -f -d -- mingw*/etc/gitconfig var/log/pacman.log var/log/ etc/minttyrc etc/profile.d/00-setup.sh && { MSYS2_ARG_CONV_EXCL="*" "${COMSPEC}" /S /Q /C "start .\\\\unins000.exe /Silent"; }) & exit -1; }; }'
+					], FSO.BuildPath(FSO.BuildPath(FSO.BuildPath(msys2_dir, "etc"), "profile.d"), "00-setup.sh"), null, newline);
+					save_text([
+						"",
+						"PS1='\\[\\e[33;1m\\]$PWD\\[\\e[36;1m\\]\\[\\e[0;1m\\]$ '",
+						"true || { 1>&2 echo 'Welcome to Git-Bash, a Linux-like environment for Windows.' && 1>&2 echo 'Your Windows drives can be accessed at the following paths:' && 1>&2 sed -e '/^\\s*\\([^\\# \\t].*\\) \\(\\S\\+\\) \\(\\S\\+\\) \\(\\S\\+\\) \\(\\S\\+\\) \\(\\S\\+\\)$/!d;s//\\3\\t\\2\\t\\1/g' -e '/^\\(tmpfs\\|proc\\|devpts\\|sysfs\\|binfmt_misc\\)\\t/d' -e 's/^[^\\t]*\\t//g' -e '/^\\(\\/\\|\\/bin\\|\\/tmp\\)\\t/d' -e '/^[^\\t]*\\t\\/bin\\t/d' -- /proc/mounts; }"
+					], FSO.BuildPath(FSO.BuildPath(msys2_dir, "etc"), "bash.bashrc"), 8, newline);
+				} finally {
+					if (FSO.FileExists(tempinfpath)) {
+						try {
+							FSO.DeleteFile(tempinfpath);
+						} catch (ex) { /* ignore errors deleting temporary files */ }
+					}
+				}
+			} finally {
+				if (tempfilepath !== local_file && FSO.FileExists(tempfilepath)) {
+					try {
+						if (delete_downloads_before_exit) { FSO.DeleteFile(tempfilepath); }
+					} catch (ex) { /* ignore errors deleting temporary files */ }
+				}
+			}
+		}
+		if (!msys2_dir || !FSO.FolderExists(msys2_dir)) {
+			throw new Error("Folder " + msys2_dir + " should contain the MSYS2 portion of Git-for-Windows, but doesn't seem to!");
+		}
+		var msys2_bin_dir = FSO.BuildPath(FSO.BuildPath(msys2_dir, "usr"), "bin");
+		var mingw_dir = FSO.GetParentFolderName(FSO.GetParentFolderName(WshShell.RegRead("HKEY_LOCAL_MACHINE\\SOFTWARE\\GitForWindows\\LibexecPath")));
+		if (!mingw_dir || !FSO.FolderExists(mingw_dir)) {
+			throw new Error("Folder " + mingw_dir + " should contain the MinGW portion of Git-for-Windows, but doesn't seem to!");
+		}
+		var mingw_bin_dir = FSO.BuildPath(mingw_dir, "bin");
+		var PATH = WshProcEnv('PATH');
+		WshProcEnv('PATH') = [msys2_bin_dir, mingw_bin_dir, WshProcEnv('PATH')].join(";")
+		try {
+			if (!FSO.FileExists(FSO.BuildPath(msys2_bin_dir, "python" + ".exe"))) {
+				if (confirm_installation() === false) { return -1; }
+				msys2_install_package(msys2_dir, mingw_dir, python_url, KNOWN_FILE_SHA256_HASHES[msysarch], delete_downloads_before_exit);
+			}
+		} finally {
+			WshProcEnv('PATH') = PATH;
+		}
+		WScript.StdErr.WriteLine(asterisks);
+		WScript.StdErr.WriteLine("Successfully install Python into Git-for-Windows. You can uninstall it later by typing '" + uninstall_git_for_windows + "' in Git-Bash.");
+		if (false) { WScript.StdErr.WriteLine("If you want to uninstall Python later, first uninstall Git, then delete the \"" + msys2_dir + "\" directory."); }
+	} catch (ex) {
+		WScript.StdErr.WriteLine("ERROR: " + ex.message);
+		throw ex;
+	} finally {
+		if (WScript.Interactive && !ctrl_c_pressed) {
+			WScript.StdErr.Write("Press ENTER to quit...");
+			try {
+				WScript.StdIn.ReadLine();
+			} catch (ex) {
+				if (ex.number ^ COR_E_ENDOFSTREAM) {
+					throw ex;
+				}
+			}
+		}
+	}
+}
+
+(function () {
+	var argv = [];
+	for (var i = 0; i < WScript.Arguments.length; i++) {
+		argv.push(WScript.Arguments(i));
+	}
+	WScript.Quit(main(argv));
+})();
